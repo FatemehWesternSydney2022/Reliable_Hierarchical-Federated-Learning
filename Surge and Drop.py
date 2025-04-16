@@ -890,18 +890,18 @@ def HierFL(args, trainloaders, valloaders, testloader):
     )
 
     # ✅ Start Federated Learning Simulation
-    #fl.simulation.start_simulation(
-        #client_fn=lambda cid: FlowerClient(
-            #model=Net(),
-            #trainloader=trainloaders[int(cid)],
-            #valloader=valloaders[int(cid)],
-            #testloader=testloader,
-            #cid=int(cid)
-        #),
-        #num_clients=len(trainloaders),
-        #config=fl.server.ServerConfig(num_rounds=args['GLOBAL_ROUNDS']),
-        #strategy=strategy
-    #)
+    fl.simulation.start_simulation(
+        client_fn=lambda cid: FlowerClient(
+            model=Net(),
+            trainloader=trainloaders[int(cid)],
+            valloader=valloaders[int(cid)],
+            testloader=testloader,
+            cid=int(cid)
+        ),
+        num_clients=len(trainloaders),
+        config=fl.server.ServerConfig(num_rounds=args['GLOBAL_ROUNDS']),
+        strategy=strategy
+    )
 
     # ✅ Ensure CSV file exists before starting logging
     if not os.path.exists(log_file_path):
