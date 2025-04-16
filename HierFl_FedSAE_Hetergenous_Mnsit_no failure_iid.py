@@ -189,6 +189,8 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
               mu_k = np.random.uniform(50, 60)
               sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)
               client.affordable_workload = np.random.normal(mu_k, sigma_k)
+              if not hasattr(client, "affordable_workload_init"):
+                client.affordable_workload_init = client.affordable_workload
               print(f"Client {client.cid} Workload: {client.affordable_workload:.2f}")
               client.affordable_workload_logged = round_number  # Mark as updated for this round
               
@@ -199,7 +201,7 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
               if not hasattr(client, 'upper_bound'):
                   client.upper_bound = 20
               if not hasattr(client, 'threshold'):
-                  client.threshold = client.lower_bond
+                  client.threshold = client.upper_bound
 
               # ✅ Step 2: Maintain previous bounds if client has been selected before
               if client.cid in client_previous_bounds:
@@ -297,14 +299,7 @@ def compute_training_rounds(client_id, clients, base_k1):
 # Energy Consumption
 ########################################
 def compute_energy(
-    affordable_workload,
-    model_size_bits,
-    samples_per_epoch=100,
-    train_time_sample=0.01,       # seconds per sample
-    computation_power=0.5,        # Watts
-    transmitter_power=0.1,        # Watts
-    channel_capacity=1_000_000    # bits per second
-)
+    affordable_workload, train_time_sample, computation_power, transmitter_power, model_size_bits, channel_capacity):
 
     # Training time per sample
     total_training_time = affordable_workload * train_time_sample
@@ -319,7 +314,7 @@ def compute_energy(
     # Step 3: Total energy
     total_energy = energy_comp + energy_comm
 
-    return energy_comp, energy_comm, total_energy
+    return energy_comp, energy_comm, total_energy, total_training_time
 
 
 ########################################
@@ -338,7 +333,7 @@ class FlowerClient(fl.client.NumPyClient):
         self.affordable_workload = self.initialize_affordable_workload()
         self.lower_bound = 10
         self.upper_bound = 20
-        self.threshold = 0
+        self.threshold = 20
 
 
     def initialize_affordable_workload(self):
@@ -403,9 +398,12 @@ def HierFL(args, trainloaders, valloaders, testloader):
     global client_history
     global_model = Net()
     global_weights = get_parameters(global_model)
-    model_size_bits = 1_000_000   # adjust based on your actual model size
-    samples_per_epoch = 100       # adjust if you use different batch/sample sizes
-    train_time_sample = 0.01      # seconds per sample
+    computation_power = 0.5        # in Watts
+    transmitter_power = 0.1        # in Watts
+    train_time_sample = 0.01       # seconds per sample
+    model_size_bits = 100_000      # bits
+    channel_capacity = 1_000_000   # bits/second
+    samples_per_epoch = 1000
     r1 = args['r1']
     r2 = args['r2']
 
@@ -457,23 +455,23 @@ def HierFL(args, trainloaders, valloaders, testloader):
     )
 
     # ✅ Start Federated Learning Simulation
-    fl.simulation.start_simulation(
-        client_fn=lambda cid: FlowerClient(
-            model=Net(),
-            trainloader=trainloaders[int(cid)],
-            valloader=valloaders[int(cid)],
-            testloader=testloader,
-            cid=int(cid)
-        ),
-        num_clients=len(trainloaders),
-        config=fl.server.ServerConfig(num_rounds=args['GLOBAL_ROUNDS']),
-        strategy=strategy
-    )
+    #fl.simulation.start_simulation(
+        #client_fn=lambda cid: FlowerClient(
+            #model=Net(),
+            #trainloader=trainloaders[int(cid)],
+            #valloader=valloaders[int(cid)],
+            #testloader=testloader,
+            #cid=int(cid)
+        #),
+        #num_clients=len(trainloaders),
+        #config=fl.server.ServerConfig(num_rounds=args['GLOBAL_ROUNDS']),
+        #strategy=strategy
+    #)
 
     # ✅ Ensure CSV file exists before starting logging
     if not os.path.exists(log_file_path):
         with open(log_file_path, "w") as log_file:
-            log_file.write("Round,Client,Status,TrainingTime,LowerBound_before,UpperBound_before,LowerBound_after,UpperBound_after,ClientAffordableWorkload,NumEpoch,Theta,State\n")
+            log_file.write("Round,Client,Status,TrainingTime,LowerBound_before,UpperBound_before,LowerBound_after,UpperBound_after,AffordableWorkloadInitialize,ClientAffordableWorkload,NumEpoch,Theta,State\n")
 
 
     for round_number in range(1, args['GLOBAL_ROUNDS'] + 1):
@@ -515,18 +513,21 @@ def HierFL(args, trainloaders, valloaders, testloader):
 
             # ✅ Compute energy consumption
             affordable_workload = client.affordable_workload
-            energyCompConsumed, energyCommConsumed, total_energy_consumed, training_time = compute_energy(
-              affordable_workload=affordable_workload,
-              model_size_bits=model_size_bits,
-              samples_per_epoch=samples_per_epoch,
-              train_time_sample=train_time_sample
-              )
+            energy_comp, energy_comm, total_energy, training_time = compute_energy(
+              affordable_workload,
+              train_time_sample,
+              computation_power,
+              transmitter_power,
+              model_size_bits,
+              channel_capacity
+    )
 
 
 
             # ✅ Log training clients with workload details
+            AffordableWorkloadInitialize = client.affordable_workload_init
             with open(log_file_path, "a") as log_file:
-                log_file.write(f"{round_number},{client_id},TRAINING,{training_time},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f},{num_epochs},{client.threshold:.2f},{stage},{energyCompConsumed}, {energyCommConsumed}, {total_energy_consumed}, {total_training_time}\n")
+                log_file.write(f"{round_number},{client_id},TRAINING,{training_time},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{AffordableWorkloadInitialize:.2f},{client.affordable_workload:.2f},{num_epochs},{client.threshold:.2f},{stage},{energy_comp:.2f}, {energy_comm:.2f}, {total_energy:.2f}, {total_training_time:.2f}\n")
 
 
         # ✅ Edge Aggregation
@@ -582,7 +583,7 @@ def main():
         'r1': 3,
         'r2': 1,
         'base_k1': 60,
-        'num_epochs': 60,
+        'num_epochs': 10,
         'k1': 60,  # Local updates parameter
         'k2': 1  # Edge-to-cloud aggregation frequency
     }
