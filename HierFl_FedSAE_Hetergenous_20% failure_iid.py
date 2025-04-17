@@ -403,7 +403,7 @@ class FlowerClient(fl.client.NumPyClient):
         self.affordable_workload = self.initialize_affordable_workload()
         self.lower_bound = 10
         self.upper_bound = 20
-        self.threshold = 0
+        self.threshold = 20
 
 
     def initialize_affordable_workload(self):
