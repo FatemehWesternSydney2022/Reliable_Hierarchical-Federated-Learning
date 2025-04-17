@@ -19,6 +19,7 @@ from math import ceil
 import torch.optim as optim
 import torch.nn.functional as F
 import os
+from math import floor
 print("📁 Current working directory:", os.getcwd())
 
 log_file_path = "client_task_log.csv"
@@ -230,9 +231,10 @@ def test(net, testloader):
 # Avergae Epoch time calculation
 ########################################
 def calculate_avg_epochs_per_client(training_epochs, num_clients):
-    total_epochs = sum(training_epochs.values())  # Use epoch counts, not seconds
+    total_epochs = sum(training_epochs.values())
     avg_epochs_per_client = total_epochs / num_clients if num_clients > 0 else 0
     return avg_epochs_per_client
+
 
 
 ########################################
@@ -240,24 +242,27 @@ def calculate_avg_epochs_per_client(training_epochs, num_clients):
 ########################################
 client_previous_bounds = {}
 
-def adjust_task_assignment(round_number, clients, selected_clients, log_file_path, alpha, r1, r2, training_times, failure_history, predicted_failure_time, lstm_model, num_epochs):
+
+def adjust_task_assignment(round_number, clients, selected_clients, log_file_path, alpha, r1, r2, training_times, failure_history, predicted_failure_time, lstm_model, num_epochs,args, avg_epoch):
 
     global client_previous_bounds  # Access the global dictionary
     args = {'GLOBAL_ROUNDS': 50,
-            'alpha': 0.95}
+            'alpha': 0.95,
+            'base_r1' : 0.2,
+            'base_r2': 0.1,
+            }
 
     
     client = next(c for c in clients if c.cid == selected_clients[0])
     
     failure_history = client.failure_history 
 
-    # Get average epoch time per client
-    avg_epoch = calculate_avg_epochs_per_client(training_times, len(clients))
-    print(f"Average epoch time per client: {avg_epoch}")
     
     # Adjust r1 and r2 based on average epoch time
-    r1 = r1 * avg_epoch  # r1 as a percentage of average epoch time
-    r2 = r2 * avg_epoch  # r2 as a percentage of average epoch time
+    r1 = args['base_r1'] * avg_epoch  # r1 as a percentage of average epoch time
+    print(f"Adjusted r1: {r1}")
+    r2 = args['base_r2'] * avg_epoch  # r2 as a percentage of average epoch time
+    print(f"Adjusted r2: {r2}")
 
 
     # ✅ Step 1: Retrieve previous round bounds if client was selected before
@@ -289,7 +294,13 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
               mu_k = np.random.uniform(50, 60)
               sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)
               client.affordable_workload = np.random.normal(mu_k, sigma_k)
+              AffordableWorkloadInitilize = client.affordable_workload
               print(f"Client {client.cid} Workload: {client.affordable_workload:.2f}")
+              NumEpoch = floor(AffordableWorkloadInitilize)
+              client.num_epochs = NumEpoch  # Store in the client object
+              training_epochs[client.cid] = NumEpoch  # Also store in global or shared dictionary
+
+              
               client.affordable_workload_logged = round_number  # Mark as updated for this round
               
 
@@ -299,7 +310,7 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
               if not hasattr(client, 'upper_bound'):
                   client.upper_bound = 20
               if not hasattr(client, 'threshold'):
-                  client.threshold = client.threshold = client.lower_bond
+                  client.threshold = client.threshold = client.upper_bound
 
               # ✅ Step 2: Maintain previous bounds if client has been selected before
               if client.cid in client_previous_bounds:
@@ -368,6 +379,9 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
               client.lower_bound = L_tk_after
               client.upper_bound = H_tk_after
               print(f"Client {client.cid} Updated Bounds: L={L_tk_after:.2f}, H={H_tk_after:.2f}")
+
+              with open(log_file_path, "a") as log_file:
+                log_file.write(f"{round_number},{client.cid},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{AffordableWorkloadInitilize},{client.affordable_workload:.2f},{NumEpoch:.2f},{client.threshold:.2f},{r1:.2f},{r2:.2f},{stage}\n")
               
 
               
@@ -380,15 +394,15 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
 # Trainig round adjustment
 ########################################
 def compute_training_rounds(client_id, clients, base_k1):
-    """
-    Compute training rounds dynamically to ensure average k1 remains base_k1.
-    Increase training rounds if needed.
-    """
     client = next(c for c in clients if c.cid == client_id)
-    training_rounds = max(10, int(round(base_k1 * (client.affordable_workload / 60), 2)))
+    training_rounds = int(round(base_k1 * (client.affordable_workload / 60), 2))
 
-    # Scale up if training time is too short
-    return max(training_rounds, 20)  # Ensures at least 20 epochs
+    # ✅ Use initial (pre-adjusted) workload as a lower bound
+    min_epochs = int(client.initial_affordable_workload)
+    return  max(min_epochs, training_rounds)
+
+
+ 
 
 
 
@@ -686,7 +700,7 @@ def compute_energy(
     computation_power=0.5,        # Watts
     transmitter_power=0.1,        # Watts
     channel_capacity=1_000_000    # bits per second
-
+):
     # Training time per sample
     total_training_time = affordable_workload * train_time_sample
 
@@ -700,7 +714,7 @@ def compute_energy(
     # Step 3: Total energy
     total_energy = energy_comp + energy_comm
 
-    return energy_comp, energy_comm, total_energy
+    return energy_comp, energy_comm, total_energy, total_training_time
 
 
 ########################################
@@ -719,23 +733,27 @@ class FlowerClient(fl.client.NumPyClient):
 
         # ✅ Initialize affordable workload
         self.affordable_workload = self.initialize_affordable_workload()
+        self.initial_affordable_workload = self.affordable_workload
+        self.num_epochs = int(self.affordable_workload)
         self.lower_bound = 10
         self.upper_bound = 20
-        self.threshold = 0
+        self.threshold = 20
         self.failure_history = []
-        self.num_epochs = 0 
+
+        
+
 
 
     def initialize_affordable_workload(self):
         """Generate a client's affordable workload using a normal distribution."""
         mu_k = np.random.uniform(50, 60)  # Mean workload
         sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)  # Standard deviation
-        return max(0, np.random.normal(mu_k, sigma_k))  # Ensure workload is non-negative
+        value = max(0, np.random.normal(mu_k, sigma_k))
+        print(f"Client {self.cid} initialized with workload: {value}")
+        self.initial_affordable_workload = value 
+        return value  # Ensure workload is non-negative
 
-    def reset_affordable_workload(self):
-        """Reset affordable workload when a client recovers from failure."""
-        self.affordable_workload = 0
-        print(f"🔄 Client {self.cid} recovered. Affordable workload reset to 0.")
+
 
     def get_parameters(self):
         return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
@@ -757,20 +775,19 @@ class FlowerClient(fl.client.NumPyClient):
 
         # ✅ Ensure client_id exists in client_history
         if client_id not in client_history:
+            initial_epochs = int(self.initial_affordable_workload)
             print(f"⚠️ Warning: Client {client_id} not found in client_history. Initializing with default values.")
             client_history[client_id] = {
-                "L": 10, "H": 20, "epochs": 10, "task": "Easy",
+                "L": 10, "H": 20, "epochs": initial_epochs, "task": "Easy",
                 "training_time": [], "accuracy": []
             }
 
-        num_epochs = config.get("num_epochs", 60)  # Default to 60 if missing
-        num_epochs = int(num_epochs) if num_epochs else 60  # Ensure integer
+        num_epochs = config.get("num_epochs")
+        if num_epochs is None:
+          num_epochs = int(self.initial_affordable_workload)  # Fallback to initial workload if not specified
+
         self.num_epochs = num_epochs
-        global training_epochs
-          
-        training_epochs[client_id] = num_epochs  
-
-
+        training_epochs[client_id] = self.num_epochs 
 
 
         print(f"Client {client_id}: Training for {num_epochs} epochs (Affordable Workload: {self.affordable_workload:.2f})")
@@ -839,9 +856,9 @@ def HierFL(args, trainloaders, valloaders, testloader):
     model_size_bits = 1_000_000   # adjust based on your actual model size
     samples_per_epoch = 100       # adjust if you use different batch/sample sizes
     train_time_sample = 0.01      # seconds per sample
-    r1 = args['r1']
-    r2 = args['r2']
-    r3 = args['r3']
+    r1 = args['base_r1']
+    r2 = args['base_r2']
+    r3 = args['base_r3']
 
 
 
@@ -890,18 +907,18 @@ def HierFL(args, trainloaders, valloaders, testloader):
     )
 
     # ✅ Start Federated Learning Simulation
-    fl.simulation.start_simulation(
-        client_fn=lambda cid: FlowerClient(
-            model=Net(),
-            trainloader=trainloaders[int(cid)],
-            valloader=valloaders[int(cid)],
-            testloader=testloader,
-            cid=int(cid)
-        ),
-        num_clients=len(trainloaders),
-        config=fl.server.ServerConfig(num_rounds=args['GLOBAL_ROUNDS']),
-        strategy=strategy
-    )
+    #fl.simulation.start_simulation(
+        #client_fn=lambda cid: FlowerClient(
+            #model=Net(),
+            #trainloader=trainloaders[int(cid)],
+            #valloader=valloaders[int(cid)],
+            #testloader=testloader,
+            #cid=int(cid)
+        #),
+        #num_clients=len(trainloaders),
+        #config=fl.server.ServerConfig(num_rounds=args['GLOBAL_ROUNDS']),
+        #strategy=strategy
+    #)
 
     # ✅ Ensure CSV file exists before starting logging
     if not os.path.exists(log_file_path):
@@ -947,7 +964,9 @@ def HierFL(args, trainloaders, valloaders, testloader):
                 predicted_failure_time=predicted_failure_time,
                 failure_history=failure_history,
                 lstm_model=lstm_model,
-                num_epochs= args['NUM_EPOCHS'] ,
+                num_epochs=training_epochs,
+                avg_epoch=avg_epoch,
+                args=args
             )
 
 
@@ -956,6 +975,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
             client = clients[client_id]  # ✅ Correctly reference the client
             server1.add_client(client)
 
+            AffordableWorkloadInitilize = client.affordable_workload
             num_epochs = compute_training_rounds(client_id, clients, args['base_k1'])
             client = clients[client_id]  # ✅ Correctly reference the client
 
@@ -1042,9 +1062,9 @@ def main():
         'FAILURE_RATE': 0.2,
         'FAILURE_DURATION': 50,
         'alpha': 0.95,
-        'r1': 0.3,
-        'r2': 0.1,
-        'r3': 0.8,
+        'base_r1': 0.2,
+        'base_r2': 0.1,
+        'base_r3': 0.8,
         'base_k1': 60,
         'NUM_EPOCHS': 60,
         'k1': 60,  # Local updates parameter
