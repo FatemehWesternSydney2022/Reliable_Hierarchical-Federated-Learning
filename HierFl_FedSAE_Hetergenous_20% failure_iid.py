@@ -197,7 +197,7 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
               if not hasattr(client, 'upper_bound'):
                   client.upper_bound = 20
               if not hasattr(client, 'threshold'):
-                  client.threshold = client.lower_bond
+                  client.threshold = client.upper_bound
 
               # ✅ Step 2: Maintain previous bounds if client has been selected before
               if client.cid in client_previous_bounds:
@@ -670,6 +670,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
