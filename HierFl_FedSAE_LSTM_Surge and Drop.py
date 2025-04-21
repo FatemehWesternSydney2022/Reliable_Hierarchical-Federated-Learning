@@ -96,6 +96,7 @@ class EdgeDevice:
         self.valloader = valloader
         self.model = Net()  # Each device has its own local model
 
+
     def get_client(self):
       return FlowerClient(self.model, self.trainloader, self.valloader, self.device_id, self.device_id)
 
@@ -104,95 +105,143 @@ class EdgeDevice:
 # EdgeServer Class
 ########################################
 class EdgeServer:
-    def __init__(self, server_id, devices: List[EdgeDevice], backup_servers: List['EdgeServer'] = []):
+    def __init__(self, server_id, devices: List['EdgeDevice'], backup_server: 'EdgeServer' = None):
         self.server_id = server_id
-        self.devices = devices
-        self.model = Net()  # Each edge server has its own local model
-        self.failed = False  # Track if the server has failed
-        self.backup_servers = backup_servers  # List of backup servers
-    
+        self.devices = devices  # List of EdgeDevice instances
+        self.model = Net()      # Each edge server has its own local model
+        self.failed = False     # Track failure status
+        self.backup_server = backup_server  # One backup edge server
+
     def is_failed(self):
         return self.failed
-    
-    def handle_failure(self):
-        """Handles the failure of the server and reassigns clients to backup servers."""
+
+    def handle_failure(self, edge_servers: List['EdgeServer'], client_to_server_map: dict):
+        """Mark self as failed and reassign all clients to the backup server."""
         self.failed = True
-        print(f"Edge server {self.server_id} has failed. Reassigning clients...")
-        
-        # Reassign all clients to available backup servers
+        print(f"⚠️ Edge server {self.server_id} has failed. Reassigning clients...")
+
         for backup_server in self.backup_servers:
-            if not backup_server.is_failed():
-                # Transfer all clients to the backup server
-                for device in self.devices:
-                    backup_server.add_device(device)  # Reassign device
-                self.devices.clear()  # Clear the devices from the failed server
-                print(f"Clients reassigned to backup server {backup_server.server_id}.")
-                break  # Exit once we've reassigned to one backup server
-    
+          if backup_server != self and not backup_server.is_failed():
+              for device in self.devices:
+                  if hasattr(device, "client") and device.client is not None:
+                    backup_server.add_device(device)
+                    client_to_server_map[device.client.cid] = backup_server.server_id
+                    print(f"✅ Client {device.client.cid} reassigned to EdgeServer {backup_server.server_id}")
+                  else:
+                    print(f"⚠️ Device {device.device_id} has no associated client.")
+
+              self.devices.clear()
+              print(f"✅ Clients reassigned to backup server {backup_server.server_id}.")
+              return  # Exit after successful reassignment
+
+        print(f"❌ Backup server not available for server {self.server_id}.")
 
     def add_device(self, device: 'EdgeDevice'):
-        """Add a device to the server."""
+        """Add a device (client wrapper) to this server."""
         self.devices.append(device)
 
-    def add_client(self, client: 'FlowerClient'):
-        """Add a client to the server."""
-        self.devices.append(client)  # Assuming that `client` is linked to a device
-    
     def remove_device(self, device: 'EdgeDevice'):
-        """Remove a device from the server."""
+        """Remove a device from this server."""
         self.devices.remove(device)
 
     def aggregate(self):
-        """Aggregate models from all connected devices."""
-        total_samples = 0
-        weighted_params = None
+      """Aggregate models from all connected devices."""
+      total_samples = 0
+      weighted_params = None
 
-        for device in self.devices:
-            client = device.get_client()
-            parameters = client.get_parameters()
-            num_samples = len(device.trainloader.dataset)
+      for device in self.devices:
+          client = device.get_client()
+          if client is None:
+              print(f"⚠️ Device {device.device_id} has no client. Skipping.")
+              continue
 
-            if weighted_params is None:
-                weighted_params = [num_samples * np.array(param) for param in parameters]
-            else:
-                for i, param in enumerate(parameters):
-                    weighted_params[i] += num_samples * np.array(param)
+          parameters = client.get_parameters()
+          if parameters is None:
+              print(f"⚠️ Client {client.cid} has no parameters. Skipping.")
+              continue
 
-            total_samples += num_samples
+          num_samples = len(device.trainloader.dataset)
+          if weighted_params is None:
+              weighted_params = [num_samples * np.array(param) for param in parameters]
+          else:
+              for i, param in enumerate(parameters):
+                  weighted_params[i] += num_samples * np.array(param)
 
-        # Average the parameters
-        aggregated_params = [param / total_samples for param in weighted_params]
-        return aggregated_params
+          total_samples += num_samples
+
+      if total_samples == 0 or weighted_params is None:
+          print(f"⚠️ Edge server {self.server_id} has no valid data for aggregation.")
+          return None
+
+      # Average the parameters
+      aggregated_params = [param / total_samples for param in weighted_params]
+      return aggregated_params
+
+
 
 ########################################
-# manages a network of edge servers
-########################################      
-class EdgeServerNetwork:
-    def __init__(self):
-        self.servers = []
-    
-    def add_server(self, server):
-        self.servers.append(server)
-    
-    def find_backup_server(self, failed_server):
-        # Find a non-failed backup server from the failed server's neighbors
-        for neighbor in failed_server.neighbors:
-            if not neighbor.failed:
-                return neighbor
-        return None  # If no available backup server, return None
+# Random Edge Server Backup
+########################################
+def assign_random_backups(edge_servers: List[EdgeServer], edge_devices: List[EdgeDevice]):
+    for server in edge_servers:
+        possible_backups = [s for s in edge_servers if s.server_id != server.server_id]
+        server.backup_server = random.choice(possible_backups)
+        print(f"Server {server.server_id} assigned backup server {server.backup_server.server_id}.")
 
-    def handle_failure(self, failed_server):
-        backup_server = self.find_backup_server(failed_server)
-        if backup_server:
-            failed_server.handle_failure()
-            print(f"Server {failed_server.server_id} is down. Clients reassigned to server {backup_server.server_id}.")
-        else:
-   
-            print("No available backup server found.")
+########################################
+# Initilize edge server with their backup edge server
+########################################
+def initialize_edge_servers_with_backups(edge_devices: List[EdgeDevice], num_servers: int) -> Tuple[List[EdgeServer], dict]:
+    """
+    Initializes edge servers with backups and assigns clients.
+    Also builds the initial client-to-server mapping.
+    """
+    edge_servers = [EdgeServer(server_id=i, devices=[]) for i in range(num_servers)]
+    client_to_server_map = {}
+
+    # ✅ Assign one random backup for each edge server (excluding itself)
+    for server in edge_servers:
+        possible_backups = [s for s in edge_servers if s.server_id != server.server_id]
+        server.backup_servers = [random.choice(possible_backups)]
+
+    # ✅ Assign devices evenly across edge servers
+    devices_per_server = len(edge_devices) // num_servers
+    for i, server in enumerate(edge_servers):
+        start = i * devices_per_server
+        end = None if i == num_servers - 1 else (i + 1) * devices_per_server
+        server.devices = edge_devices[start:end]
+
+        # ✅ Update client-to-server mapping
+        for device in server.devices:
+            if hasattr(device, "client") and device.client is not None:
+                client_to_server_map[device.client.cid] = server.server_id
+
+    return edge_servers, client_to_server_map
+
+
+########################################
+# Edge Server's Failure
+########################################
+def simulate_edge_failures(edge_servers: List[EdgeServer], failed_servers: set, client_to_server_map,failure_rate: float = 0.05):
+    available_servers = [s for s in edge_servers if not s.is_failed()]
+
+    if not available_servers:
+        print("⚠️ All edge servers have failed. Skipping failure simulation.")
+        return
+
+    num_to_fail = max(1, int(len(edge_servers) * failure_rate))  # At least one server fails
+    servers_to_fail = random.sample(available_servers, min(num_to_fail, len(available_servers)))
+
+    for server_to_fail in servers_to_fail:
+        server_to_fail.handle_failure(edge_servers,client_to_server_map)
+        failed_servers.add(server_to_fail.server_id)
+
+
+
 ########################################
 # hold each client’s ID
 ########################################
- 
+
 class Client:
     def __init__(self, cid):
         self.cid = cid  # Client ID
@@ -252,12 +301,12 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
             'base_r2': 0.1,
             }
 
-    
-    client = next(c for c in clients if c.cid == selected_clients[0])
-    
-    failure_history = client.failure_history 
 
-    
+    client = next(c for c in clients if c.cid == selected_clients[0])
+
+    failure_history = client.failure_history
+
+
     # Adjust r1 and r2 based on average epoch time
     r1 = args['base_r1'] * avg_epoch  # r1 as a percentage of average epoch time
     print(f"Adjusted r1: {r1}")
@@ -270,7 +319,7 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
           L_tk_before, H_tk_before = client_previous_bounds[client.cid]  # Reuse previous values
     else:
           L_tk_before, H_tk_before = client.lower_bound, client.upper_bound  # Use initial values
-    
+
     with open(log_file_path, "a") as log_file:
       for round_number in range(1, args['GLOBAL_ROUNDS'] + 1):
 
@@ -289,8 +338,8 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
 
             # ✅ Normal Worklaod pattern
             for client in clients:
-              
-              
+
+
               mu_k = np.random.uniform(50, 60)
               sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)
               client.affordable_workload = np.random.normal(mu_k, sigma_k)
@@ -300,9 +349,9 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
               client.num_epochs = NumEpoch  # Store in the client object
               training_epochs[client.cid] = NumEpoch  # Also store in global or shared dictionary
 
-              
+
               client.affordable_workload_logged = round_number  # Mark as updated for this round
-              
+
 
               # ✅ Initialize workload range only once
               if not hasattr(client, 'lower_bound'):
@@ -338,10 +387,10 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                       client.upper_bound += r1
                       stage = STAGE_START
                   client.affordable_workload = H_tk_before
-                  
+
 
               elif L_tk_before < client.affordable_workload <= H_tk_before:
-                  
+
                   if client.threshold >= L_tk_before:
                       print("STRAGELLER")
                       client.lower_bound = min(client.lower_bound + r2, 0.5 * H_tk_before)
@@ -353,9 +402,9 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                       client.lower_bound = min(client.lower_bound + r1, 0.5 * H_tk_before)
                       client.upper_bound = max(client.lower_bound + r1, 0.5 * H_tk_before)
                       stage = STAGE_STRAGELLER
-                
+
                   client.affordable_workload = L_tk_before
-                  
+
 
               else:
                       client.lower_bound = 0.5 * L_tk_before
@@ -368,7 +417,7 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
               H_tk_after = client.upper_bound
               print(f"Client {client.cid} Updated Bounds: L={L_tk_after:.2f}, H={H_tk_after:.2f}")
 
-              
+
 
               # ✅ Step 6: Store updated bounds for future reference
               client_previous_bounds[client.cid] = (L_tk_after, H_tk_after)
@@ -382,10 +431,10 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
 
               with open(log_file_path, "a") as log_file:
                 log_file.write(f"{round_number},{client.cid},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{AffordableWorkloadInitilize},{client.affordable_workload:.2f},{NumEpoch:.2f},{client.threshold:.2f},{r1:.2f},{r2:.2f},{stage}\n")
-              
 
-              
-              
+
+
+
             return L_tk_before, H_tk_before, L_tk_after, H_tk_after, stage
 
 
@@ -400,10 +449,6 @@ def compute_training_rounds(client_id, clients, base_k1):
     # ✅ Use initial (pre-adjusted) workload as a lower bound
     min_epochs = int(client.initial_affordable_workload)
     return  max(min_epochs, training_rounds)
-
-
- 
-
 
 
 ########################################
@@ -610,43 +655,43 @@ def adjust_workload_based_on_failure(client, predict_time_to_failure, r1, r2, r3
     Adjust workload dynamically based on predicted failure time.
     If the failure time is predicted to be close, reduce workload; otherwise, increase.
     """
-    
+
 
     # Calculate the average training time per epoch across clients
     avg_training_time = sum(training_times) / len(training_times)
 
-    
+
     # Calculate the time per unit workload (seconds per unit of workload)
     time_per_unit_workload = avg_training_time / total_workload
-    
+
     # Maximum workload based on predicted time to failure
     max_workload = predict_time_to_failure / time_per_unit_workload
 
     failure_ratio = predict_time_to_failure / np.mean(list(avg_epoch.values()))
     r3_max = max_workload
-    r3 = r3_max * (1 - np.exp(-failure_ratio))  
+    r3 = r3_max * (1 - np.exp(-failure_ratio))
 
     # Define threshold failure as 10% of the predicted failure time
     threshold_percentage = 0.10  # For example, 10%
     threshold_failure = predict_time_to_failure * threshold_percentage
-    
+
 	    # State 1: Increase workload by r2 if affordable workload is less than max_workload and failure time is approaching
     if client.affordable_workload < max_workload and predict_time_to_failure < threshold_failure:
         client.affordable_workload += r2
- 
+
     # State 2: Increase workload by r1 if we are not close to failure and in the middle of the workload range
-    elif (predict_time_to_failure >= threshold_failure and 
+    elif (predict_time_to_failure >= threshold_failure and
           client.affordable_workload < max_workload):
         client.affordable_workload += r1
- 
+
     # State 3: Approaching failure and max_workload, increase workload by r3
     else:
         client.affordable_workload += r3
- 
+
     # If we exceed max workload, drop the workload to zero
     if client.affordable_workload > max_workload:
         client.affordable_workload = 0
- 
+
     return client.affordable_workload
 
 
@@ -721,8 +766,8 @@ def compute_energy(
 # FlowerClient Class
 ########################################
 class FlowerClient(fl.client.NumPyClient):
-    
-    
+
+
 
     def __init__(self, model, trainloader, testloader, valloader, cid):
         self.model = model
@@ -740,7 +785,7 @@ class FlowerClient(fl.client.NumPyClient):
         self.threshold = 20
         self.failure_history = []
 
-        
+
 
 
 
@@ -750,7 +795,7 @@ class FlowerClient(fl.client.NumPyClient):
         sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)  # Standard deviation
         value = max(0, np.random.normal(mu_k, sigma_k))
         print(f"Client {self.cid} initialized with workload: {value}")
-        self.initial_affordable_workload = value 
+        self.initial_affordable_workload = value
         return value  # Ensure workload is non-negative
 
 
@@ -787,7 +832,7 @@ class FlowerClient(fl.client.NumPyClient):
           num_epochs = int(self.initial_affordable_workload)  # Fallback to initial workload if not specified
 
         self.num_epochs = num_epochs
-        training_epochs[client_id] = self.num_epochs 
+        training_epochs[client_id] = self.num_epochs
 
 
         print(f"Client {client_id}: Training for {num_epochs} epochs (Affordable Workload: {self.affordable_workload:.2f})")
@@ -823,8 +868,8 @@ def HierFL(args, trainloaders, valloaders, testloader):
 
     log_file_path = "client_task_log.csv"
     client_history = {}
-    clients = []  
-    
+    clients = []
+
     for i in range(args['NUM_DEVICES']):
         client = FlowerClient(
             model=Net(),
@@ -835,24 +880,16 @@ def HierFL(args, trainloaders, valloaders, testloader):
         )
         clients.append(client)
         client_history[i] = {}
-        client_id = client.cid 
-        
-    # Initialize edge servers and their neighbors
-    server1 = EdgeServer(1, [])
-    server2 = EdgeServer(2, [server1])
-    server3 = EdgeServer(3, [server1])
-    server1.neighbors = [server2, server3]
+        client_id = client.cid
+
     
-    network = EdgeServerNetwork()
-    network.add_server(server1)
-    network.add_server(server2)
-    network.add_server(server3)
 
     # ✅ Initialize Failure Tracking (Only once)
     unavailability_tracker = {cid: 0 for cid in range(args['NUM_DEVICES'])}  # 0 = available, >0 = failure duration
     failure_log = []  # Store failures (Client ID, Failure Duration, Recovery Time)
     training_times = {}  # Store training times for each client
     failure_history = {}  # Store failure timestamps for each client
+    client_to_server_map = {}
     model_size_bits = 1_000_000   # adjust based on your actual model size
     samples_per_epoch = 100       # adjust if you use different batch/sample sizes
     train_time_sample = 0.01      # seconds per sample
@@ -863,7 +900,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
 
 
 
-    
+
 
     # ✅ Initialize Clients Once
     clients = [
@@ -877,10 +914,13 @@ def HierFL(args, trainloaders, valloaders, testloader):
         for i in range(args['NUM_DEVICES'])
     ]
 
+
     # ✅ Initialize Edge Devices
     edge_devices = [EdgeDevice(i, trainloaders[i], valloaders[i]) for i in range(args['NUM_DEVICES'])]
     num_edge_servers = args['NUM_EDGE_SERVERS']
     edge_servers = []
+    edge_servers, client_to_server_map = initialize_edge_servers_with_backups(edge_devices, args['NUM_EDGE_SERVERS'])
+    assign_random_backups(edge_servers, edge_devices)
     devices_per_server = len(edge_devices) // num_edge_servers
 
     for i in range(num_edge_servers):
@@ -942,7 +982,19 @@ def HierFL(args, trainloaders, valloaders, testloader):
 
         # ✅ Simulate failures before selecting clients
         failure_log, recovered_this_round= simulate_failures(args, unavailability_tracker, failure_log, round_number, training_times, selected_clients, lstm_model, failure_history)
+       
+        # Simulate failure per round
+        if round_number == 1:
+          failed_servers = set()
+        simulate_edge_failures(edge_servers, failed_servers, failure_rate=0.05, client_to_server_map = client_to_server_map)
+        # ✅ Handle edge server failures after simulating client failures
+        for server in edge_servers:
+          if server.is_failed():
+            server.handle_failure(edge_servers, client_to_server_map)
 
+        
+        
+        
         # ✅ Adjust workloads before selecting clients using failure predictions
         training_times = {client.cid: client_history.get(client.cid, {}).get("training_time", [0])[-1] for client in clients}
         training_epochs = {client.cid: client.num_epochs for client in clients}
@@ -950,7 +1002,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
         print(f"Training epochs per client: {training_epochs}")  # ✅ Debug check
         print(f"Average epoch time per client: {avg_epoch}")
 
-               
+
         predicted_failure_time = predict_time_to_failure(lstm_model, failure_history, client_id)
         L_tk_before, H_tk_before, L_tk_after, H_tk_after, stage = adjust_task_assignment(
                 round_number=round_number,
@@ -973,7 +1025,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
         for client_id in selected_clients:
 
             client = clients[client_id]  # ✅ Correctly reference the client
-            server1.add_client(client)
+            
 
             AffordableWorkloadInitilize = client.affordable_workload
             num_epochs = compute_training_rounds(client_id, clients, args['base_k1'])
@@ -997,9 +1049,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
 
             predicted_time = getattr(client, "predicted_failure_time", -1.0)
 
-            for server in network.servers:
-              if server.is_failed():
-                network.handle_failure(server)
+
 
 
             # ✅ Log training clients with workload details
@@ -1014,8 +1064,9 @@ def HierFL(args, trainloaders, valloaders, testloader):
         if round_number % args["k2"] == 0:
             print(f"🔹 Aggregating at EDGE SERVER (every {args['k2']} rounds)")
             for edge_server in edge_servers:
-                aggregated_params = edge_server.aggregate()
-                set_parameters(edge_server.model, aggregated_params)
+               if not edge_server.is_failed():
+                  aggregated_params = edge_server.aggregate()
+                  set_parameters(edge_server.model, aggregated_params)
 
         # ✅ Global Aggregation
         if round_number % (args["k1"] * args["k2"]) == 0:
