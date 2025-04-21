@@ -117,7 +117,7 @@ class EdgeServer:
         return self.failed
 
     def handle_failure(self, edge_servers: List['EdgeServer'], client_to_server_map: dict):
-      
+
       """Handles the failure of the server and reassigns clients to a valid backup server dynamically."""
       self.failed = True
       print(f"⚠️ Edge server {self.server_id} has failed. Reassigning clients...")
@@ -800,19 +800,24 @@ class FlowerClient(fl.client.NumPyClient):
         self.upper_bound = 20
         self.threshold = 20
         self.failure_history = []
+        self.affordable_workload = self.initialize_affordable_workload()
+        self.num_epochs = int(round(self.affordable_workload))
+
 
 
 
 
 
     def initialize_affordable_workload(self):
-        """Generate a client's affordable workload using a normal distribution."""
-        mu_k = np.random.uniform(50, 60)  # Mean workload
-        sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)  # Standard deviation
-        value = max(0, np.random.normal(mu_k, sigma_k))
-        print(f"Client {self.cid} initialized with workload: {value}")
-        self.initial_affordable_workload = value
-        return value  # Ensure workload is non-negative
+      """Generate a client's affordable workload using a normal distribution."""
+
+      # ✅ Initialize affordable workload
+      mu_k = np.random.uniform(50, 60)  # Mean workload
+      sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)  # Standard deviation
+      value = max(0, np.random.normal(mu_k, sigma_k))
+      print(f"Client {self.cid} initialized with workload: {value}")
+      self.initial_affordable_workload = value
+      return value  # Ensure workload is non-negative
 
 
 
@@ -904,7 +909,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
       device = EdgeDevice(i, trainloaders[i], valloaders[i], clients[i])  # ✅ Attach client
       edge_devices.append(device)
 
-    
+
 
     # ✅ Initialize Failure Tracking (Only once)
     unavailability_tracker = {cid: 0 for cid in range(args['NUM_DEVICES'])}  # 0 = available, >0 = failure duration
@@ -1004,7 +1009,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
 
         # ✅ Simulate failures before selecting clients
         failure_log, recovered_this_round= simulate_failures(args, unavailability_tracker, failure_log, round_number, training_times, selected_clients, lstm_model, failure_history)
-       
+
         # Simulate failure per round
         if round_number == 1:
           failed_servers = set()
@@ -1014,18 +1019,30 @@ def HierFL(args, trainloaders, valloaders, testloader):
           if server.is_failed():
             server.handle_failure(edge_servers, client_to_server_map)
 
+
+
+
         
+
+
+        predicted_failure_time = predict_time_to_failure(lstm_model, failure_history, client_id)
         
-        
-        # ✅ Adjust workloads before selecting clients using failure predictions
+
+
+        for client_id in selected_clients:
+
+            client = clients[client_id]  # ✅ Correctly reference the client
+
+
+            client.affordable_workload = client.initialize_affordable_workload()
+
+            # ✅ Adjust workloads before selecting clients using failure predictions
         training_times = {client.cid: client_history.get(client.cid, {}).get("training_time", [0])[-1] for client in clients}
         training_epochs = {client.cid: client.num_epochs for client in clients}
         avg_epoch = calculate_avg_epochs_per_client(training_epochs, len(clients))
         print(f"Training epochs per client: {training_epochs}")  # ✅ Debug check
         print(f"Average epoch time per client: {avg_epoch}")
 
-
-        predicted_failure_time = predict_time_to_failure(lstm_model, failure_history, client_id)
         L_tk_before, H_tk_before, L_tk_after, H_tk_after, stage = adjust_task_assignment(
                 round_number=round_number,
                 clients=clients,
@@ -1043,13 +1060,11 @@ def HierFL(args, trainloaders, valloaders, testloader):
                 args=args
             )
 
-
         for client_id in selected_clients:
-
             client = clients[client_id]  # ✅ Correctly reference the client
-            
-
-            AffordableWorkloadInitilize = client.affordable_workload
+            num_epochs = int(round(client.affordable_workload))
+            client.num_epochs = num_epochs
+            training_epochs[client_id] = num_epochs
             num_epochs = compute_training_rounds(client_id, clients, args['base_k1'])
             client = clients[client_id]  # ✅ Correctly reference the client
 
@@ -1127,7 +1142,7 @@ def main():
 
     args = {
         'NUM_DEVICES': 20,
-        'NUM_EDGE_SERVERS': 5,
+        'NUM_EDGE_SERVERS': 10,
         'GLOBAL_ROUNDS':10,
         'LEARNING_RATE': 0.001,
         'DEVICE': torch.device("cuda" if torch.cuda.is_available() else "cpu"),
