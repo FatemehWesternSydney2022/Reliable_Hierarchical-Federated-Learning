@@ -90,11 +90,12 @@ class LSTMFailurePredictor(nn.Module):
 # EdgeDevice Class
 ########################################
 class EdgeDevice:
-    def __init__(self, device_id, trainloader, valloader):
+    def __init__(self, device_id, trainloader, valloader, client=None):
         self.device_id = device_id
         self.trainloader = trainloader
         self.valloader = valloader
         self.model = Net()  # Each device has its own local model
+        self.client = client
 
 
     def get_client(self):
@@ -105,36 +106,50 @@ class EdgeDevice:
 # EdgeServer Class
 ########################################
 class EdgeServer:
-    def __init__(self, server_id, devices: List['EdgeDevice'], backup_server: 'EdgeServer' = None):
+    def __init__(self, server_id, devices: List['EdgeDevice'], backup_servers: 'EdgeServer' = None):
         self.server_id = server_id
         self.devices = devices  # List of EdgeDevice instances
         self.model = Net()      # Each edge server has its own local model
         self.failed = False     # Track failure status
-        self.backup_server = backup_server  # One backup edge server
+        self.backup_servers = []
 
     def is_failed(self):
         return self.failed
 
     def handle_failure(self, edge_servers: List['EdgeServer'], client_to_server_map: dict):
-        """Mark self as failed and reassign all clients to the backup server."""
-        self.failed = True
-        print(f"⚠️ Edge server {self.server_id} has failed. Reassigning clients...")
+      
+      """Handles the failure of the server and reassigns clients to a valid backup server dynamically."""
+      self.failed = True
+      print(f"⚠️ Edge server {self.server_id} has failed. Reassigning clients...")
 
-        for backup_server in self.backup_servers:
-          if backup_server != self and not backup_server.is_failed():
+      # Try the assigned backup server first
+      backup_servers = self.backup_servers if hasattr(self, "backup_servers") else []
+
+      # Add fallback: if no backup assigned or all backups failed, pick one dynamically
+      if not backup_servers or all(server.is_failed() for server in backup_servers):
+          available_backups = [s for s in edge_servers if not s.is_failed() and s != self]
+          if available_backups:
+              selected_backup = random.choice(available_backups)
+              self.backup_servers = [selected_backup]
+              print(f"🔁 Dynamically assigned backup server {selected_backup.server_id} to server {self.server_id}")
+          else:
+              print(f"❌ No available backup servers to reassign clients from server {self.server_id}")
+              return
+
+      # Reassign all clients to the first available backup
+      for backup_server in self.backup_servers:
+          if not backup_server.is_failed():
               for device in self.devices:
-                  if hasattr(device, "client") and device.client is not None:
-                    backup_server.add_device(device)
-                    client_to_server_map[device.client.cid] = backup_server.server_id
-                    print(f"✅ Client {device.client.cid} reassigned to EdgeServer {backup_server.server_id}")
-                  else:
-                    print(f"⚠️ Device {device.device_id} has no associated client.")
-
+                  backup_server.add_device(device)
+                  if device.client:
+                      client_to_server_map[device.client.cid] = backup_server.server_id
               self.devices.clear()
               print(f"✅ Clients reassigned to backup server {backup_server.server_id}.")
-              return  # Exit after successful reassignment
+              return
 
-        print(f"❌ Backup server not available for server {self.server_id}.")
+      print(f"❌ Backup server not available or all failed for server {self.server_id}.")
+
+
 
     def add_device(self, device: 'EdgeDevice'):
         """Add a device (client wrapper) to this server."""
@@ -193,30 +208,31 @@ def assign_random_backups(edge_servers: List[EdgeServer], edge_devices: List[Edg
 ########################################
 def initialize_edge_servers_with_backups(edge_devices: List[EdgeDevice], num_servers: int) -> Tuple[List[EdgeServer], dict]:
     """
-    Initializes edge servers with backups and assigns clients.
-    Also builds the initial client-to-server mapping.
+    Initializes edge servers with backup server lists and assigns devices.
+    Returns both the edge server list and client-to-server mapping.
     """
     edge_servers = [EdgeServer(server_id=i, devices=[]) for i in range(num_servers)]
     client_to_server_map = {}
 
-    # ✅ Assign one random backup for each edge server (excluding itself)
+    # ✅ Assign 2 random backup servers for better resilience (excluding itself)
     for server in edge_servers:
         possible_backups = [s for s in edge_servers if s.server_id != server.server_id]
-        server.backup_servers = [random.choice(possible_backups)]
+        server.backup_servers = random.sample(possible_backups, k=min(2, len(possible_backups)))
 
-    # ✅ Assign devices evenly across edge servers
+    # ✅ Distribute devices evenly across edge servers
     devices_per_server = len(edge_devices) // num_servers
     for i, server in enumerate(edge_servers):
         start = i * devices_per_server
         end = None if i == num_servers - 1 else (i + 1) * devices_per_server
         server.devices = edge_devices[start:end]
 
-        # ✅ Update client-to-server mapping
+        # ✅ Register client-to-server mapping
         for device in server.devices:
             if hasattr(device, "client") and device.client is not None:
                 client_to_server_map[device.client.cid] = server.server_id
 
     return edge_servers, client_to_server_map
+
 
 
 ########################################
@@ -869,8 +885,10 @@ def HierFL(args, trainloaders, valloaders, testloader):
     log_file_path = "client_task_log.csv"
     client_history = {}
     clients = []
+    edge_devices = []
 
     for i in range(args['NUM_DEVICES']):
+
         client = FlowerClient(
             model=Net(),
             trainloader=trainloaders[i],
@@ -881,6 +899,10 @@ def HierFL(args, trainloaders, valloaders, testloader):
         clients.append(client)
         client_history[i] = {}
         client_id = client.cid
+
+    for i in range(args['NUM_DEVICES']):
+      device = EdgeDevice(i, trainloaders[i], valloaders[i], clients[i])  # ✅ Attach client
+      edge_devices.append(device)
 
     
 
@@ -1058,6 +1080,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
 
             with open("client_failure_prediction.csv", "a") as log_file:
                 log_file.write(f"{round_number},{client.cid},{predicted_time:.2f}\n")
+
 
 
         # ✅ Edge Aggregation
